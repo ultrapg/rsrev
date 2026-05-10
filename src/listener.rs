@@ -19,11 +19,29 @@ fn main() {
         std::process::exit(1);
     });
 
-    let listener = TcpListener::bind(format!("0.0.0.0:{}", port)).unwrap_or_else(|e| {
+    // Firewall-Freigabe für den Port versuchen
+    try_open_firewall(port);
+
+    use socket2::{Socket, Domain, Type, Protocol};
+    let addr = format!("0.0.0.0:{}", port).parse::<std::net::SocketAddr>().unwrap();
+    let socket = Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP)).unwrap_or_else(|e| {
+        eprintln!("[!] socket: {}", e);
+        std::process::exit(1);
+    });
+    socket.set_reuse_address(true).unwrap_or_else(|e| {
+        eprintln!("[!] set_reuse_address: {}", e);
+        std::process::exit(1);
+    });
+    socket.set_nonblocking(true).unwrap();
+    socket.bind(&addr.into()).unwrap_or_else(|e| {
         eprintln!("[!] bind: {}", e);
         std::process::exit(1);
     });
-    listener.set_nonblocking(true).unwrap();
+    socket.listen(1024).unwrap_or_else(|e| {
+        eprintln!("[!] listen: {}", e);
+        std::process::exit(1);
+    });
+    let listener: TcpListener = socket.into();
 
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default().with_inner_size([1000.0, 680.0]),
@@ -73,6 +91,7 @@ struct ListenerApp {
     ul_state: UlState,
     fm: FileManager,
     show_tab: bool, // true = shell, false = files
+    read_buf: Vec<u8>,
 }
 
 impl ListenerApp {
@@ -89,6 +108,7 @@ impl ListenerApp {
             ul_state: UlState::Idle,
             fm: FileManager::new(),
             show_tab: true,
+            read_buf: Vec::new(),
         }
     }
 
@@ -103,21 +123,51 @@ impl ListenerApp {
             Some(s) => s,
             None => return false,
         };
-        stream.set_read_timeout(Some(Duration::from_millis(5))).ok();
 
-        match read_frame(stream) {
-            Ok(frame) => {
+        // Read all available data into the buffer (non-blocking)
+        stream.set_read_timeout(Some(Duration::from_millis(1))).ok();
+        let mut temp = [0u8; 65536];
+        loop {
+            match stream.read(&mut temp) {
+                Ok(0) => {
+                    self.status = "[!] Connection closed".into();
+                    self.connected = false;
+                    self.stream = None;
+                    self.dl_state = DlState::Idle;
+                    self.ul_state = UlState::Idle;
+                    return true;
+                }
+                Ok(n) => self.read_buf.extend_from_slice(&temp[..n]),
+                Err(ref e)
+                    if e.kind() == io::ErrorKind::WouldBlock
+                        || e.kind() == io::ErrorKind::TimedOut =>
+                {
+                    break;
+                }
+                Err(_) => {
+                    self.status = "[!] Connection lost".into();
+                    self.connected = false;
+                    self.stream = None;
+                    self.dl_state = DlState::Idle;
+                    self.ul_state = UlState::Idle;
+                    return true;
+                }
+            }
+        }
+
+        // Try to parse one frame from the buffer
+        match parse_frame(&self.read_buf) {
+            Ok((frame, consumed)) => {
+                self.read_buf.drain(..consumed);
                 match frame {
                     Frame::Msg(msg) => self.handle_msg(msg),
                     Frame::Chunk(chunk) => self.handle_chunk(chunk),
                 }
                 true
             }
-            Err(ref e)
-                if e.kind() == io::ErrorKind::WouldBlock
-                    || e.kind() == io::ErrorKind::TimedOut => false,
-            Err(_) => {
-                self.status = "[!] Connection lost".into();
+            Err(ParseError::NeedMore) => false,
+            Err(ParseError::Invalid(e)) => {
+                self.status = format!("[!] Protocol error: {}", e);
                 self.connected = false;
                 self.stream = None;
                 self.dl_state = DlState::Idle;
@@ -487,7 +537,6 @@ impl eframe::App for ListenerApp {
                         self.status = format!("[*] Connected from {}", addr);
                         self.connected = true;
                         self.stream = Some(stream);
-                        self.listener = None;
                     }
                     Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {}
                     Err(e) => self.status = format!("[!] Accept error: {}", e),
@@ -522,4 +571,43 @@ fn format_size(size: u64) -> String {
     while s >= 1024.0 && i < UNITS.len() - 1 { s /= 1024.0; i += 1; }
     if i == 0 { format!("{} B", size) }
     else { format!("{:.1} {}", s, UNITS[i]) }
+}
+
+fn try_open_firewall(port: u16) {
+    #[cfg(target_os = "windows")]
+    {
+        let rule_name = format!("rsrev Listener (port {})", port);
+        let status = std::process::Command::new("netsh")
+            .args([
+                "advfirewall",
+                "firewall",
+                "add",
+                "rule",
+                &format!("name={}", rule_name),
+                "dir=in",
+                "action=allow",
+                "protocol=TCP",
+                &format!("localport={}", port),
+            ])
+            .output();
+        match status {
+            Ok(out) if out.status.success() => {
+                eprintln!("[*] Firewall rule added for port {}", port);
+            }
+            Ok(out) => {
+                let stderr = String::from_utf8_lossy(&out.stderr);
+                if !stderr.trim().is_empty() {
+                    eprintln!("[!] Firewall: {}", stderr.trim());
+                }
+                eprintln!("[!] Could not add firewall rule (try running as admin)");
+            }
+            Err(e) => {
+                eprintln!("[!] Firewall command failed: {}", e);
+            }
+        }
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = port;
+    }
 }
