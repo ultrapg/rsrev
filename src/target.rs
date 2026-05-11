@@ -44,7 +44,19 @@ fn main() {
         let mut shell: Option<Child> = None;
 
         'inner: loop {
+            if let Some(ref mut c) = shell {
+                if let Ok(Some(_)) = c.try_wait() {
+                    shell = None;
+                }
+            }
+
             let frame = loop {
+                if let Some(ref mut c) = shell {
+                    if let Ok(Some(_)) = c.try_wait() {
+                        shell = None;
+                    }
+                }
+
                 let mut s = stream.lock().unwrap();
                 s.set_read_timeout(Some(Duration::from_millis(100))).ok();
                 match read_frame(&mut *s) {
@@ -113,7 +125,7 @@ fn main() {
                             let _ = write_msg(&mut *s, &Message::FileError(format!("{}", e)));
                         }
                     }
-                    Message::Exit => break,
+                    Message::Exit => return,
                     _ => {}
                 },
                 Frame::Chunk(_) => {
