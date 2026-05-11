@@ -3,6 +3,7 @@ use std::io::{self, Read, Write};
 use std::net::TcpStream;
 
 pub const CHUNK_SIZE: usize = 65536;
+pub const MAX_MSG_SIZE: usize = 10 * 1024 * 1024; // 10 MB
 
 #[derive(Debug, PartialEq)]
 pub enum ParseError {
@@ -76,6 +77,9 @@ pub fn parse_frame(data: &[u8]) -> Result<(Frame, usize), ParseError> {
                 return Err(ParseError::NeedMore);
             }
             let len = u32::from_le_bytes(data[1..5].try_into().unwrap()) as usize;
+            if len > MAX_MSG_SIZE {
+                return Err(ParseError::Invalid(format!("message too large: {} bytes", len)));
+            }
             if data.len() < 5 + len {
                 return Err(ParseError::NeedMore);
             }
@@ -115,6 +119,9 @@ pub fn read_frame(stream: &mut TcpStream) -> io::Result<Frame> {
             let mut len_buf = [0u8; 4];
             stream.read_exact(&mut len_buf)?;
             let len = u32::from_le_bytes(len_buf) as usize;
+            if len > MAX_MSG_SIZE {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, format!("message too large: {} bytes", len)));
+            }
             let mut buf = vec![0u8; len];
             stream.read_exact(&mut buf)?;
             let msg: Message = serde_json::from_slice(&buf)
